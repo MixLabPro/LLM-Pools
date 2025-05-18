@@ -26,7 +26,7 @@ logging.basicConfig(
 # 测试配置
 SERVER_URL = "http://localhost:8000"  # 服务器地址
 API_KEY = "test-api-key"  # API密钥
-CONCURRENT_REQUESTS = 3  # 并发请求数
+CONCURRENT_REQUESTS = 6  # 并发请求数
 REQUEST_TIMEOUT = 30  # 请求超时时间(秒)
 
 # 测试提示词列表
