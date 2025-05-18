@@ -1,12 +1,6 @@
 {
   "large_models": [
     {
-      "url": "https://api.mistral.ai/v1/",
-      "model": "open-mixtral-8x22b",
-      "api_key": "PEi2OZMKUpqeZ0npjW8pwVwnTTd2Rv6j",
-      "request": 1
-    },
-    {
       "url": "https://mixcopilot.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21",
       "model": "gpt-4o",
       "api_key": "c9da7907ebe2442d97fbaa8d9aec7443",
@@ -16,8 +10,8 @@
   "small_models": [
     {
       "url": "https://api.siliconflow.cn/v1/",
-      "model": "THUDM/GLM-4-9B-0414",
-      "api_key": "sk-ljhpdcshzgosgtvaeiplmwkwxrvuodxmqndjnengsxhususk",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "api_key": "sk-wvfzhvxedtruzcpbfkxqyzviumujngsfivdhwnaydrtrivip",
       "request": 2
     }
   ],

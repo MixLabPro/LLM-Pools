@@ -170,6 +170,11 @@ class OpenAICompatibleAPI:
                 },
                 "queue_length": self.router_manager.queue_manager.get_queue_length()
             }
+            
+        # 添加/status端点与/health保持一致，提供兼容性
+        @self.api.get("/status")
+        async def status_check():
+            return await health_check()
     
     async def _regular_response(self, request_data: Dict[str, Any], model: str, user_level: int = 0) -> Dict[str, Any]:
         """
@@ -194,7 +199,7 @@ class OpenAICompatibleAPI:
         # 如果有错误，抛出异常
         if error:
             raise HTTPException(
-                status_code=500 if "超时" in error else 400,
+                status_code=400,  # 始终使用400，不再特殊处理超时
                 detail={"error": error}
             )
         
@@ -261,7 +266,7 @@ class OpenAICompatibleAPI:
                 "error": {
                     "message": error,
                     "type": "router_error",
-                    "code": "500" if "超时" in error else "400"
+                    "code": "400"  # 始终使用400，不再特殊处理超时
                 }
             }
             error_json = json.dumps(error_response)

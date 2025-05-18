@@ -219,6 +219,12 @@ class RouterManager:
         start_time = self.request_start_times.get(request_id, time.time())
         
         try:
+            # 日志记录当前负载情况
+            pool_status = self.llm_pool_manager.get_status()
+            large_load = pool_status['large_pool']['current_load']
+            small_load = pool_status['small_pool']['current_load']
+            logging.info(f"[{request_id}] 处理请求前池状态 - 大模型: {large_load}/{pool_status['large_pool']['total_capacity']}, 小模型: {small_load}/{pool_status['small_pool']['total_capacity']}")
+            
             # 发送请求到LLM（带重试）
             response, error, llm_name = await self.llm_pool_manager.send_request_with_retry(
                 request_id=request_id,
@@ -282,6 +288,12 @@ class RouterManager:
                     tokens_generated=int(tokens_generated)
                 )
             
+            # 记录请求结束后的负载情况
+            pool_status = self.llm_pool_manager.get_status()
+            large_load = pool_status['large_pool']['current_load']
+            small_load = pool_status['small_pool']['current_load']
+            logging.info(f"[{request_id}] 处理请求后池状态 - 大模型: {large_load}/{pool_status['large_pool']['total_capacity']}, 小模型: {small_load}/{pool_status['small_pool']['total_capacity']}")
+            
             # 清理请求记录
             if request_id in self.request_start_times:
                 del self.request_start_times[request_id]
@@ -311,7 +323,7 @@ class RouterManager:
         endpoint: str,
         request_data: Dict[str, Any],
         stream: bool = False,
-        timeout_seconds: Optional[int] = None,
+        timeout_seconds: Optional[int] = None,  # 保留参数但不再使用
         user_level: int = 0
     ) -> Tuple[Any, Optional[str], float]:
         """
@@ -323,7 +335,7 @@ class RouterManager:
             endpoint: API端点
             request_data: 请求数据
             stream: 是否使用流式响应
-            timeout_seconds: 超时时间(秒)
+            timeout_seconds: 超时时间(秒)，已禁用，仅为兼容性保留
             user_level: 用户等级
             
         Returns:
@@ -357,7 +369,7 @@ class RouterManager:
             model_pool=model_pool,
             request_data=complete_request_data,
             user_level=user_level,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=None,  # 传入None，实际上队列管理器已忽略此参数
             callback=request_callback
         )
         
@@ -432,29 +444,116 @@ class RouterManager:
         """
         while self.running:
             try:
-                # 检查大模型池
-                if not self.llm_pool_manager.large_pool.is_full():
-                    # 尝试从队列获取请求
-                    request = self.queue_manager.dequeue_request("large")
-                    if request:
-                        # 处理大模型请求
-                        await self._handle_queued_request(request)
-                        continue
+                # 获取队列详情
+                queue_details = self.queue_manager.get_queue_details()
                 
-                # 检查小模型池
-                if not self.llm_pool_manager.small_pool.is_full():
-                    # 尝试从队列获取请求
-                    request = self.queue_manager.dequeue_request("small")
-                    if request:
-                        # 处理小模型请求
-                        await self._handle_queued_request(request)
-                        continue
+                # 获取当前池状态
+                pool_status = self.llm_pool_manager.get_status()
+                large_pool = self.llm_pool_manager.large_pool
+                small_pool = self.llm_pool_manager.small_pool
                 
-                # 如果没有请求需要处理，等待一会儿
-                await asyncio.sleep(0.1)
+                # 计算可用槽位
+                large_capacity = large_pool.get_total_capacity()
+                small_capacity = small_pool.get_total_capacity()
+                large_load = large_pool.get_current_load()
+                small_load = small_pool.get_current_load()
+                available_large_slots = large_capacity - large_load
+                available_small_slots = small_capacity - small_load
+                
+                # 记录详细的负载情况
+                logging.info(f"【队列处理】当前队列状态: 队列大模型请求={queue_details['large']}, 队列小模型请求={queue_details['small']}")
+                logging.info(f"【负载情况】当前池负载: 大模型池={large_load}/{large_capacity}, 小模型池={small_load}/{small_capacity}")
+                logging.info(f"【可用槽位】当前可用槽位: 大模型池={available_large_slots}, 小模型池={available_small_slots}")
+                
+                # 没有请求需要处理，或者没有可用槽位
+                if (queue_details['large'] == 0 and queue_details['small'] == 0) or (available_large_slots == 0 and available_small_slots == 0):
+                    logging.debug("没有请求需要处理或没有可用槽位，等待下一轮检查")
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # 批量处理逻辑：尝试同时取出所有可以处理的请求
+                batch_tasks = []
+                processed_count = 0
+                
+                # 对大模型池的处理
+                if available_large_slots > 0 and (queue_details['large'] > 0 or queue_details['small'] > 0):
+                    logging.info(f"【大模型池处理】尝试从队列取出最多 {available_large_slots} 个请求处理...")
+                    
+                    # 记录处理前的大模型池负载
+                    before_large_load = large_pool.get_current_load()
+                    
+                    for _ in range(min(available_large_slots, queue_details['large'] + queue_details['small'])):
+                        request = self.queue_manager.dequeue_request("large")
+                        if request:
+                            # 立即开始处理，但不等待完成
+                            task = asyncio.create_task(self._handle_queued_request(request))
+                            batch_tasks.append(task)
+                            processed_count += 1
+                            logging.info(f"【请求分配】从队列取出请求 {request.request_id} 分配给大模型池处理")
+                        else:
+                            logging.debug("没有更多请求可分配给大模型池")
+                            break
+                    
+                    # 检查负载是否增加
+                    await asyncio.sleep(0.1)  # 稍微等待一下，让负载计数更新
+                    after_large_load = large_pool.get_current_load()
+                    if after_large_load > before_large_load:
+                        logging.info(f"【负载变化】大模型池负载增加: {before_large_load} -> {after_large_load}")
+                    else:
+                        logging.warning(f"【负载异常】大模型池负载未增加: {before_large_load} -> {after_large_load}，可能有问题")
+                
+                # 对小模型池的处理
+                if available_small_slots > 0 and (queue_details['large'] > 0 or queue_details['small'] > 0):
+                    logging.info(f"【小模型池处理】尝试从队列取出最多 {available_small_slots} 个请求处理...")
+                    
+                    # 记录处理前的小模型池负载
+                    before_small_load = small_pool.get_current_load()
+                    
+                    for _ in range(min(available_small_slots, queue_details['large'] + queue_details['small'])):
+                        request = self.queue_manager.dequeue_request("small")
+                        if request:
+                            # 立即开始处理，但不等待完成
+                            task = asyncio.create_task(self._handle_queued_request(request))
+                            batch_tasks.append(task)
+                            processed_count += 1
+                            logging.info(f"【请求分配】从队列取出请求 {request.request_id} 分配给小模型池处理")
+                        else:
+                            logging.debug("没有更多请求可分配给小模型池")
+                            break
+                    
+                    # 检查负载是否增加
+                    await asyncio.sleep(0.1)  # 稍微等待一下，让负载计数更新
+                    after_small_load = small_pool.get_current_load()
+                    if after_small_load > before_small_load:
+                        logging.info(f"【负载变化】小模型池负载增加: {before_small_load} -> {after_small_load}")
+                    else:
+                        logging.warning(f"【负载异常】小模型池负载未增加: {before_small_load} -> {after_small_load}，可能有问题")
+                
+                # 如果处理了请求，等待所有请求至少开始处理
+                if batch_tasks:
+                    # 记录批处理情况
+                    logging.info(f"【批处理】本轮处理了 {len(batch_tasks)} 个请求")
+                    
+                    # 等待足够的时间以确保负载计数更新
+                    await asyncio.sleep(0.5)
+                    
+                    # 验证负载是否已更新
+                    new_large_load = large_pool.get_current_load()
+                    new_small_load = small_pool.get_current_load()
+                    logging.info(f"【负载核实】处理后池负载: 大模型池={new_large_load}/{large_capacity}, 小模型池={new_small_load}/{small_capacity}")
+                    
+                    # 如果负载状态异常（总负载比预期低），记录警告
+                    total_expected_load = large_load + small_load + processed_count
+                    total_actual_load = new_large_load + new_small_load
+                    if total_actual_load < total_expected_load:
+                        logging.warning(f"【负载异常】预期总负载 {total_expected_load}，实际总负载 {total_actual_load}，可能有请求未被正确计入负载")
+                else:
+                    # 如果没有处理任何请求，等待一会儿再检查
+                    logging.debug("本轮没有处理任何请求，等待下一轮检查")
+                    await asyncio.sleep(0.1)
                 
             except Exception as e:
-                logging.error(f"队列处理器异常: {str(e)}")
+                logging.error(f"【队列处理异常】{str(e)}")
                 await asyncio.sleep(1)
     
     async def _handle_queued_request(self, queued_request):
@@ -467,6 +566,7 @@ class RouterManager:
         request_id = queued_request.request_id
         request_data = queued_request.request_data
         callback = queued_request.callback
+        model_pool = queued_request.model_pool
         
         try:
             # 提取请求参数
@@ -477,20 +577,39 @@ class RouterManager:
             # 计算队列等待时间
             queue_wait_time = time.time() - queued_request.arrival_time
             
+            # 记录开始处理请求
+            logging.info(f"【队列请求处理】{request_id} 开始处理 (池类型: {model_pool}, 等待时间: {queue_wait_time:.2f}秒)")
+            
+            # 处理请求前记录当前池状态
+            pool_status = self.llm_pool_manager.get_status()
+            large_load = pool_status['large_pool']['current_load']
+            small_load = pool_status['small_pool']['current_load']
+            logging.info(f"【当前池状态】请求 {request_id} 处理前 - 大模型: {large_load}/{pool_status['large_pool']['total_capacity']}, 小模型: {small_load}/{pool_status['small_pool']['total_capacity']}")
+            
             # 处理请求
             response, error, processing_time = await self.process_request(
                 request_id=request_id,
-                model_pool=queued_request.model_pool,
+                model_pool=model_pool,
                 endpoint=endpoint,
                 request_data=payload,
                 stream=stream
             )
             
+            # 处理请求后记录池状态变化
+            pool_status_after = self.llm_pool_manager.get_status()
+            large_load_after = pool_status_after['large_pool']['current_load']
+            small_load_after = pool_status_after['small_pool']['current_load']
+            logging.info(f"【当前池状态】请求 {request_id} 处理后 - 大模型: {large_load_after}/{pool_status_after['large_pool']['total_capacity']}, 小模型: {small_load_after}/{pool_status_after['small_pool']['total_capacity']}")
+            
             # 调用回调函数
             if callback:
                 callback(response, error)
+                logging.debug(f"【回调执行】请求 {request_id} 回调已执行")
             
             # 记录完整处理信息
+            result_status = "成功" if error is None else f"失败: {error}"
+            logging.info(f"【队列请求完成】{request_id} 处理{result_status}，等待时间: {queue_wait_time:.2f}秒，处理时间: {processing_time:.2f}秒")
+            
             if self.logger:
                 self.logger.info(
                     f"队列请求处理完成，等待时间: {queue_wait_time:.2f}秒，处理时间: {processing_time:.2f}秒",
@@ -499,7 +618,7 @@ class RouterManager:
             
         except Exception as e:
             error_msg = f"处理队列请求异常: {str(e)}"
-            logging.error(f"[{request_id}] {error_msg}")
+            logging.error(f"【队列请求异常】{request_id}: {error_msg}")
             
             if self.logger:
                 self.logger.error(error_msg, request_id)
@@ -507,6 +626,7 @@ class RouterManager:
             # 调用回调函数报告错误
             if callback:
                 callback(None, error_msg)
+                logging.debug(f"【回调执行】请求 {request_id} 错误回调已执行")
     
     async def stop(self) -> None:
         """

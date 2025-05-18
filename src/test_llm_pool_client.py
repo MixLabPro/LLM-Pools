@@ -8,10 +8,13 @@ import json
 import logging
 import random
 from typing import Dict, Any, List
+import openai
 import httpx
 from tqdm import tqdm
 import prettytable
 from datetime import datetime
+import argparse
+import sys
 
 # 配置日志
 logging.basicConfig(
@@ -23,7 +26,7 @@ logging.basicConfig(
 # 测试配置
 SERVER_URL = "http://localhost:8000"  # 服务器地址
 API_KEY = "test-api-key"  # API密钥
-CONCURRENT_REQUESTS = 20  # 并发请求数
+CONCURRENT_REQUESTS = 3  # 并发请求数
 REQUEST_TIMEOUT = 30  # 请求超时时间(秒)
 
 # 测试提示词列表
@@ -117,75 +120,87 @@ class RequestStats:
         """获取进行中的请求"""
         return self.in_progress
 
-async def send_request(request_id: str, prompt: str, stats: RequestStats) -> None:
+async def send_request(request_id: str, prompt: str, model: str, stats: RequestStats) -> None:
     """
     发送请求到LLM池服务器
     
     Args:
         request_id: 请求ID
         prompt: 提示词
+        model: 模型类型 ("large", "small", "default")
         stats: 统计对象
     """
     try:
         # 记录请求开始
         await stats.start_request(request_id)
         
+        # 使用OpenAI SDK创建客户端
+        client = openai.AsyncOpenAI(
+            api_key=API_KEY,
+            base_url=f"{SERVER_URL}/v1",
+            timeout=REQUEST_TIMEOUT
+        )
+        
         # 构造请求数据
-        payload = {
-            "messages": [{"role": "user", "content": prompt}],
-            "pool_type": "default",  # 使用默认池（大模型池）
-            "request_id": request_id,
-            "stream": True,
-            "model": "default"  # 添加model字段，设为default
-        }
+        messages = [{"role": "user", "content": prompt}]
         
         # 发送请求
         start_time = time.time()
         
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.post(
-                f"{SERVER_URL}/v1/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {API_KEY}"}
+        try:
+            # 使用标准的OpenAI SDK调用
+            logging.info(f"[{request_id}] 开始发送请求 (模型: {model}, 提示词: {prompt[:30]}...)")
+            
+            response = await client.chat.completions.create(
+                model=model,  # 使用指定的模型
+                messages=messages,
+                stream=False,
+                user=request_id  # 使用user字段作为请求标识符
             )
             
             response_time = time.time() - start_time
             
-            if response.status_code == 200:
-                response_data = response.json()
-                
-                # 解析响应
-                content = ""
-                tokens = 0
-                llm_name = "未知LLM"
-                
-                if "usage" in response_data:
-                    tokens = response_data["usage"].get("total_tokens", 0)
-                
-                if "llm_info" in response_data:
-                    llm_name = response_data["llm_info"]
-                
-                if "choices" in response_data and len(response_data["choices"]) > 0:
-                    if "message" in response_data["choices"][0]:
-                        content = response_data["choices"][0]["message"].get("content", "")
-                
-                # 记录请求完成
-                await stats.complete_request(request_id, llm_name, response_time, tokens)
-                
-                logging.info(f"[{request_id}] 请求完成: {llm_name}, 耗时: {response_time:.2f}秒, Tokens: {tokens}")
-                
-                # 仅打印内容的前30个字符
-                content_preview = content[:30] + "..." if len(content) > 30 else content
-                logging.debug(f"[{request_id}] 响应内容: {content_preview}")
+            # 解析响应
+            content = ""
+            tokens = 0
+            llm_name = "未知LLM"
+            
+            # 从响应中获取信息
+            if hasattr(response, 'usage') and response.usage:
+                tokens = getattr(response.usage, 'total_tokens', 0)
+            
+            # 尝试从自定义字段获取LLM信息
+            if hasattr(response, 'llm_info'):
+                llm_name = response.llm_info
             else:
-                error = f"HTTP错误: {response.status_code}, {response.text}"
-                await stats.fail_request(request_id, error)
-                logging.error(f"[{request_id}] {error}")
+                # 尝试从模型名称获取信息
+                llm_name = getattr(response, 'model', '未知LLM')
+            
+            # 获取生成的内容
+            if hasattr(response, 'choices') and response.choices:
+                if hasattr(response.choices[0], 'message'):
+                    content = getattr(response.choices[0].message, 'content', '')
+            
+            # 记录请求完成
+            await stats.complete_request(request_id, llm_name, response_time, tokens)
+            
+            logging.info(f"[{request_id}] 请求完成: 使用LLM={llm_name}, 耗时: {response_time:.2f}秒, Tokens: {tokens}")
+            
+            # 仅打印内容的前30个字符
+            content_preview = content[:30] + "..." if len(content) > 30 else content
+            logging.info(f"[{request_id}] 响应内容: {content_preview}")
+                
+        except Exception as e:
+            error = f"OpenAI API调用失败: {str(e)}"
+            await stats.fail_request(request_id, error)
+            logging.error(f"[{request_id}] {error}")
+            # 失败后不重试
     
     except Exception as e:
         error = f"请求异常: {str(e)}"
         await stats.fail_request(request_id, error)
         logging.error(f"[{request_id}] {error}")
+        # 失败后不重试
 
 async def print_live_stats(stats: RequestStats, total_requests: int):
     """打印实时统计信息"""
@@ -288,12 +303,27 @@ async def print_final_stats(stats: RequestStats):
 async def get_server_status():
     """获取服务器状态"""
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.get(f"{SERVER_URL}/status")
+        # 使用 httpx 直接发送异步请求
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{SERVER_URL}/status", timeout=5)
+            # 记录HTTP请求的日志
+            logging.info(f'HTTP请求: GET {SERVER_URL}/status "{response.status_code} {response.reason_phrase}"')
             if response.status_code == 200:
-                return response.json()
+                # 尝试解析JSON，并捕获可能的解析错误
+                try:
+                    return response.json()
+                except json.JSONDecodeError as je:
+                    logging.error(f"服务器状态JSON解析失败: {str(je)}, 响应内容: {response.text}")
+                    return None # 或者返回一个表示错误状态的特定对象
+            else:
+                # 如果状态码不是200，也记录错误
+                logging.error(f"获取服务器状态失败，状态码: {response.status_code}, 内容: {response.text}")
+    except httpx.RequestError as e: # 更具体的异常捕获
+        #捕获 httpx 请求相关的错误
+        logging.error(f"获取服务器状态时发生请求错误: {str(e)}")
     except Exception as e:
-        logging.error(f"获取服务器状态失败: {str(e)}")
+        # 捕获其他潜在错误
+        logging.error(f"获取服务器状态时发生未知错误: {str(e)}")
     
     return None
 
@@ -357,9 +387,9 @@ async def print_server_status():
     print(f"总体利用率: {overall.get('overall_utilization_percent', 0)}%")
     print("="*50)
 
-async def main():
-    """主函数"""
-    print(f"开始LLM池并发测试 - 发送{CONCURRENT_REQUESTS}个并发请求")
+async def run_concurrent_test(concurrent_requests: int, model_type: str = None):
+    """运行并发测试"""
+    print(f"开始LLM池并发测试 - 发送{concurrent_requests}个并发请求")
     
     # 创建统计对象
     stats = RequestStats()
@@ -369,14 +399,34 @@ async def main():
     
     # 创建请求任务
     tasks = []
-    for i in range(CONCURRENT_REQUESTS):
+
+    # 分配模型类型
+    models = []
+    if model_type:
+        # 指定了模型类型，全部使用该类型
+        models = [model_type] * concurrent_requests
+    else:
+        # 未指定模型类型，随机分配大模型和小模型
+        models = []
+        for i in range(concurrent_requests):
+            # 按5:3:2的比例分配large:small:default
+            rand = random.random()
+            if rand < 0.5:
+                models.append("large")
+            elif rand < 0.8:
+                models.append("small")
+            else:
+                models.append("default")
+    
+    for i in range(concurrent_requests):
         request_id = str(uuid.uuid4())
         prompt = random.choice(TEST_PROMPTS)
-        task = asyncio.create_task(send_request(request_id, prompt, stats))
-        tasks.append(task)
+        # 确保并发发送，不要等待前一个请求完成
+        task = send_request(request_id, prompt, models[i], stats)
+        tasks.append(asyncio.create_task(task))
     
     # 创建统计打印任务
-    stats_task = asyncio.create_task(print_live_stats(stats, CONCURRENT_REQUESTS))
+    stats_task = asyncio.create_task(print_live_stats(stats, concurrent_requests))
     
     # 等待所有请求完成
     await asyncio.gather(*tasks)
@@ -394,6 +444,27 @@ async def main():
     
     # 打印服务器最终状态
     await print_server_status()
+
+async def main():
+    """主函数"""
+    # 声明全局变量
+    global SERVER_URL, CONCURRENT_REQUESTS
+    
+    parser = argparse.ArgumentParser(description='LLM池系统并发测试')
+    parser.add_argument('-c', '--concurrent', type=int, default=CONCURRENT_REQUESTS,
+                        help=f'并发请求数 (默认: {CONCURRENT_REQUESTS})')
+    parser.add_argument('-m', '--model', type=str, choices=['large', 'small', 'default'], 
+                        help='指定使用的模型类型 (默认: 随机分配)')
+    parser.add_argument('-s', '--server', type=str, default=SERVER_URL,
+                        help=f'服务器地址 (默认: {SERVER_URL})')
+    
+    args = parser.parse_args()
+    
+    # 更新全局配置
+    SERVER_URL = args.server
+    
+    # 运行测试
+    await run_concurrent_test(args.concurrent, args.model)
 
 if __name__ == "__main__":
     asyncio.run(main()) 

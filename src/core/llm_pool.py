@@ -33,8 +33,8 @@ class LLMInstance:
         
         # 当前并发请求数
         self.current_concurrency = 0
-        # 并发锁
-        self.concurrency_lock = threading.Lock()
+        # 并发锁 (使用异步锁)
+        self.concurrency_lock = asyncio.Lock()
         # 累计请求数
         self.total_requests = 0
         # 是否可用
@@ -61,38 +61,48 @@ class LLMInstance:
         Returns:
             是否成功增加并发计数
         """
-        with self.concurrency_lock:
+        async with self.concurrency_lock:
+            # 记录增加前的状态
+            old_concurrency = self.current_concurrency
+            
             if self.current_concurrency >= self.max_concurrency or not self.available:
+                logging.warning(f"【实例负载控制】LLM {self} 增加并发计数失败: 当前状态={old_concurrency}/{self.max_concurrency}, 可用状态={self.available}")
                 return False
             
             self.current_concurrency += 1
             self.total_requests += 1
-            logging.debug(f"LLM {self} 并发数增加至 {self.current_concurrency}/{self.max_concurrency}")
+            
+            # 记录增加后的状态
+            logging.info(f"【实例负载控制】LLM {self} 并发数增加: {old_concurrency} -> {self.current_concurrency}/{self.max_concurrency}")
             return True
     
-    def decrement_concurrency(self) -> None:
+    async def decrement_concurrency(self) -> None:
         """
         减少并发计数
         """
-        with self.concurrency_lock:
+        async with self.concurrency_lock:
+            old_concurrency = self.current_concurrency
+            
             if self.current_concurrency > 0:
                 self.current_concurrency -= 1
-                logging.debug(f"LLM {self} 并发数减少至 {self.current_concurrency}/{self.max_concurrency}")
+                logging.info(f"【实例负载控制】LLM {self} 并发数减少: {old_concurrency} -> {self.current_concurrency}/{self.max_concurrency}")
+            else:
+                logging.warning(f"【实例负载控制】LLM {self} 并发计数已为零，无法减少")
     
-    def mark_unavailable(self) -> None:
+    async def mark_unavailable(self) -> None:
         """
         标记LLM实例为不可用
         """
-        with self.concurrency_lock:
+        async with self.concurrency_lock:
             self.available = False
             self.last_failure_time = time.time()
             logging.warning(f"LLM {self} 已标记为不可用")
     
-    def mark_available(self) -> None:
+    async def mark_available(self) -> None:
         """
         标记LLM实例为可用
         """
-        with self.concurrency_lock:
+        async with self.concurrency_lock:
             self.available = True
             logging.info(f"LLM {self} 已恢复可用")
     
@@ -103,15 +113,15 @@ class LLMInstance:
         Returns:
             状态字典
         """
-        with self.concurrency_lock:
-            return {
-                "model": self.model,
-                "url": self.url,
-                "current_concurrency": self.current_concurrency,
-                "max_concurrency": self.max_concurrency,
-                "total_requests": self.total_requests,
-                "available": self.available
-            }
+        # 由于get_status通常是同步调用，我们直接返回当前状态而不使用异步锁
+        return {
+            "model": self.model,
+            "url": self.url,
+            "current_concurrency": self.current_concurrency,
+            "max_concurrency": self.max_concurrency,
+            "total_requests": self.total_requests,
+            "available": self.available
+        }
     
     @retry(tries=2, delay=0.5, backoff=2)
     async def send_request(
@@ -201,21 +211,23 @@ class LLMInstance:
                             if "choices" in chunk_data:
                                 for choice in chunk_data["choices"]:
                                     if "delta" in choice and "content" in choice["delta"]:
-                                        content = choice["delta"]["content"]
-                                        if content:
-                                            combined_content += content
-                            
-                            # 可以在这里处理每个块，例如实时计算tokens
-                        except json.JSONDecodeError:
-                            logging.warning(f"无法解析流式响应块: {chunk}")
+                                        delta_content = choice["delta"].get("content", "")
+                                        if delta_content:
+                                            combined_content += delta_content
+                        except json.JSONDecodeError as e:
+                            logging.warning(f"无法解析流式响应块: {e}")
                 
-                # 计算总处理时间
-                processing_time = time.time() - start_time
-                logging.debug(f"完成流式请求，耗时: {processing_time:.2f}秒, 收到 {len(chunks)} 个块")
+                # 记录请求相关信息
+                elapsed_time = time.time() - start_time
+                logging.info(f"流式请求完成, 耗时: {elapsed_time:.2f}秒, 收到 {len(chunks)} 个数据块")
                 
-                # 记录累积的内容
+                # 截取部分内容记录
                 if combined_content:
-                    logging.info(f"流式响应累积内容: {combined_content}")
+                    max_log_length = 500  # 记录最大长度
+                    log_content = combined_content[:max_log_length]
+                    if len(combined_content) > max_log_length:
+                        log_content += "..."
+                    logging.info(f"响应内容: {log_content}")
                 
                 return chunks, None
             else:
@@ -223,78 +235,99 @@ class LLMInstance:
                 response = await self.client.post(url, json=clean_payload)
                 response.raise_for_status()
                 
-                # 解析响应
+                # 解析JSON响应
                 response_data = response.json()
                 
-                # 计算总处理时间
-                processing_time = time.time() - start_time
-                logging.debug(f"完成非流式请求，耗时: {processing_time:.2f}秒")
+                # 记录请求相关信息
+                elapsed_time = time.time() - start_time
+                logging.info(f"请求完成, 耗时: {elapsed_time:.2f}秒")
                 
-                # 记录响应内容
-                log_response = response_data.copy()
+                # 记录生成的token数
+                if "usage" in response_data:
+                    usage = response_data["usage"]
+                    logging.info(
+                        f"Token使用: 输入={usage.get('prompt_tokens', 0)}, "
+                        f"输出={usage.get('completion_tokens', 0)}, "
+                        f"总计={usage.get('total_tokens', 0)}"
+                    )
                 
-                # 提取并记录响应消息内容
+                # 记录部分响应内容
                 if "choices" in response_data:
                     for choice in response_data["choices"]:
                         if "message" in choice and "content" in choice["message"]:
-                            content = choice["message"]["content"]
+                            content = choice["message"].get("content", "")
                             if content:
-                                logging.info(f"LLM响应内容: {content}")
-                
-                logging.debug(f"响应内容: {json.dumps(log_response, ensure_ascii=False)}")
+                                max_log_length = 500  # 记录最大长度
+                                log_content = content[:max_log_length]
+                                if len(content) > max_log_length:
+                                    log_content += "..."
+                                logging.info(f"响应内容: {log_content}")
                 
                 return response_data, None
                 
         except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP错误: {e.response.status_code}, {e.response.text}"
-            logging.error(f"LLM {self} 请求失败: {error_msg}")
+            error_msg = f"HTTP错误: {e.response.status_code} {e.response.reason_phrase}"
+            try:
+                error_json = e.response.json()
+                if "error" in error_json:
+                    error_msg += f" - {error_json['error'].get('message', 'Unknown error')}"
+            except:
+                error_msg += f" - 响应内容: {e.response.text}"
+            
+            logging.error(f"{self} 请求失败: {error_msg}")
             return None, error_msg
-        
+            
         except httpx.RequestError as e:
             error_msg = f"请求错误: {str(e)}"
-            logging.error(f"LLM {self} 请求失败: {error_msg}")
+            logging.error(f"{self} 请求失败: {error_msg}")
             return None, error_msg
-        
+            
         except Exception as e:
-            error_msg = f"发送请求异常: {str(e)}"
-            logging.error(f"LLM {self} 请求失败: {error_msg}")
+            error_msg = f"未知错误: {str(e)}"
+            logging.error(f"{self} 请求失败: {error_msg}")
             return None, error_msg
         
         finally:
             # 无论成功失败，都减少并发计数
-            self.decrement_concurrency()
+            await self.decrement_concurrency()
     
     async def health_check(self) -> bool:
         """
-        执行轻量级健康检查
+        健康检查
         
         Returns:
             是否健康
         """
         try:
-            # 构造简单请求
-            payload = {
+            # 简单测试请求
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant"},
+                {"role": "user", "content": "Hello, are you available?"}
+            ]
+            
+            # 发送最小测试请求
+            test_payload = {
                 "model": self.model,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "max_tokens": 5
+                "messages": messages,
+                "max_tokens": 5,
+                "temperature": 0
             }
             
-            # 发送请求
-            url = f"{self.url}/chat/completions"
-            response = await self.client.post(
-                url, 
-                json=payload, 
-                timeout=5.0
-            )
-            response.raise_for_status()
+            # 发送健康检查请求
+            response, error = await self.send_request("chat/completions", test_payload)
+            
+            if error:
+                logging.warning(f"LLM {self} 健康检查失败: {error}")
+                await self.mark_unavailable()
+                return False
             
             # 如果成功，标记为可用
-            self.mark_available()
+            await self.mark_available()
             return True
             
         except Exception as e:
             logging.warning(f"LLM {self} 健康检查失败: {str(e)}")
-            self.mark_unavailable()
+            await self.mark_unavailable()
             return False
     
     async def close(self) -> None:
@@ -375,7 +408,7 @@ class AzureLLMInstance(LLMInstance):
         """
         try:
             # 增加并发计数
-            with self.concurrency_lock:
+            async with self.concurrency_lock:
                 self.current_concurrency += 1
                 self.total_requests += 1
                 logging.debug(f"Azure LLM {self} 并发数增加至 {self.current_concurrency}/{self.max_concurrency}")
@@ -409,11 +442,15 @@ class AzureLLMInstance(LLMInstance):
                 
                 if stream:
                     # 流式请求
+                    # 确保移除stream参数
+                    if "stream" in clean_payload:
+                        del clean_payload["stream"]
+                        
                     response = await asyncio.to_thread(
                         self.azure_client.chat.completions.create,
                         model=self.deployment_id,
                         messages=clean_payload["messages"],
-                        stream=True,
+                        stream=True,  # 显式设置stream参数
                         **{k: v for k, v in clean_payload.items() if k not in ["model", "messages"]}
                     )
                     
@@ -443,10 +480,15 @@ class AzureLLMInstance(LLMInstance):
                     return chunks, None
                 else:
                     # 非流式请求
+                    # 确保移除stream参数
+                    if "stream" in clean_payload:
+                        del clean_payload["stream"]
+                        
                     response = await asyncio.to_thread(
                         self.azure_client.chat.completions.create,
                         model=self.deployment_id,
                         messages=clean_payload["messages"],
+                        stream=False,  # 显式设置stream=False
                         **{k: v for k, v in clean_payload.items() if k not in ["model", "messages"]}
                     )
                     
@@ -474,7 +516,7 @@ class AzureLLMInstance(LLMInstance):
         
         finally:
             # 无论成功失败，都减少并发计数
-            self.decrement_concurrency()
+            await self.decrement_concurrency()
     
     async def health_check(self) -> bool:
         """
@@ -497,12 +539,12 @@ class AzureLLMInstance(LLMInstance):
             )
             
             # 如果成功，标记为可用
-            self.mark_available()
+            await self.mark_available()
             return True
             
         except Exception as e:
             logging.warning(f"Azure LLM {self} 健康检查失败: {str(e)}")
-            self.mark_unavailable()
+            await self.mark_unavailable()
             return False
     
     async def close(self) -> None:
@@ -566,28 +608,51 @@ class LLMPool:
         self.llm_instances.append(instance)
         logging.info(f"已添加LLM实例到{self.pool_type}池: {model} @ {url}")
     
-    def get_available_instance(self) -> Optional[LLMInstance]:
+    async def get_available_instance(self) -> Optional[LLMInstance]:
         """
-        获取可用的LLM实例，从可用实例中随机选择一个
+        获取可用的LLM实例
         
         Returns:
-            可用的LLM实例，如果没有可用实例则返回None
+            LLM实例，如果没有可用实例则返回None
         """
-        # 获取当前可用的实例列表
-        available_instances = [inst for inst in self.llm_instances if inst.available]
+        # 记录获取前的池状态
+        current_load = self.get_current_load()
+        total_capacity = self.get_total_capacity()
+        logging.info(f"{self.pool_type}池 - 获取实例前状态: {current_load}/{total_capacity}")
+        
+        # 创建可用实例列表和日志详情
+        available_instances = []
+        instance_details = []
+        
+        for i, instance in enumerate(self.llm_instances):
+            status = "可用" if instance.available else "不可用"
+            capacity = f"{instance.current_concurrency}/{instance.max_concurrency}"
+            instance_details.append(f"  [{i+1}] {instance.model}: {capacity} ({status})")
+            
+            if instance.available and instance.current_concurrency < instance.max_concurrency:
+                available_instances.append(instance)
+        
+        # 记录每个实例的详细信息
+        logging.info(f"{self.pool_type}池 - 实例状态:\n" + "\n".join(instance_details))
         
         if not available_instances:
+            logging.info(f"{self.pool_type}池 - 无可用实例")
             return None
         
-        # 按并发数排序，找出负载最小的并发值
-        available_instances.sort(key=lambda x: x.current_concurrency)
-        min_concurrency = available_instances[0].current_concurrency
+        # 按当前并发数排序，优先使用负载较轻的实例
+        sorted_instances = sorted(available_instances, key=lambda x: x.current_concurrency)
         
-        # 找出所有并发数等于最小并发数的实例
-        candidates = [inst for inst in available_instances if inst.current_concurrency == min_concurrency]
+        # 尝试增加并发计数
+        for instance in sorted_instances:
+            if await instance.increment_concurrency():
+                # 记录获取后的池状态
+                new_load = self.get_current_load()
+                logging.info(f"{self.pool_type}池 - 获取实例后状态: {new_load}/{total_capacity}, 使用实例: {instance.model}")
+                return instance
         
-        # 从候选实例中随机选择一个
-        return random.choice(candidates) if candidates else None
+        # 如果所有实例都无法增加并发计数
+        logging.warning(f"{self.pool_type}池 - 所有实例均无法增加并发计数")
+        return None
     
     def get_status(self) -> List[Dict[str, Any]]:
         """
@@ -808,10 +873,35 @@ class LLMPoolManager:
         # 清理请求负载，移除不兼容的参数
         payload = self._clean_payload(payload)
         
+        # 获取目标池
         pool = self.get_pool(pool_type)
         
         # 尝试的LLM实例记录
         tried_instances = set()
+        
+        # 记录池状态
+        large_pool_status = self.large_pool.get_status()
+        small_pool_status = self.small_pool.get_status()
+        large_capacity = self.large_pool.get_total_capacity()
+        small_capacity = self.small_pool.get_total_capacity()
+        large_load = self.large_pool.get_current_load()
+        small_load = self.small_pool.get_current_load()
+        
+        logging.info(f"【负载状态】请求 {request_id} 发送前池状态 - 大模型: {large_load}/{large_capacity}, 小模型: {small_load}/{small_capacity}")
+        
+        # 记录实例详细状态
+        large_instances_detail = []
+        for i, inst in enumerate(large_pool_status):
+            large_instances_detail.append(f"  [{i+1}] {inst['model']} @ {inst['url']}: {inst['current_concurrency']}/{inst['max_concurrency']} ({'可用' if inst['available'] else '不可用'})")
+        
+        small_instances_detail = []
+        for i, inst in enumerate(small_pool_status):
+            small_instances_detail.append(f"  [{i+1}] {inst['model']} @ {inst['url']}: {inst['current_concurrency']}/{inst['max_concurrency']} ({'可用' if inst['available'] else '不可用'})")
+        
+        if large_instances_detail:
+            logging.info(f"【实例详情】请求 {request_id} - 大模型实例状态:\n" + "\n".join(large_instances_detail))
+        if small_instances_detail:
+            logging.info(f"【实例详情】请求 {request_id} - 小模型实例状态:\n" + "\n".join(small_instances_detail))
         
         # 获取当前池中所有可用实例
         all_pool_instances = [inst for inst in pool.llm_instances if inst.available]
@@ -826,11 +916,21 @@ class LLMPoolManager:
         # 如果没有可用实例，直接返回错误
         if not all_available_instances:
             error_msg = f"所有LLM实例都不可用，请求失败"
-            logging.error(f"[{request_id}] {error_msg}")
+            logging.error(f"【请求失败】{request_id}: {error_msg}")
             return None, error_msg, None
         
-        # 按负载排序所有实例
+        # 按负载排序所有实例 - 优先选择负载较低的实例
         all_available_instances.sort(key=lambda x: x.current_concurrency)
+        
+        # 记录可用实例详情
+        logging.info(f"【调度决策】请求 {request_id} - 可用LLM实例数: {len(all_available_instances)}")
+        available_instances_log = []
+        for i, inst in enumerate(all_available_instances):
+            instance_type = "大模型" if inst in all_pool_instances else "小模型"
+            available_instances_log.append(f"  [{i+1}] {inst.model} @ {inst.url}: {inst.current_concurrency}/{inst.max_concurrency} ({instance_type})")
+        
+        if available_instances_log:
+            logging.info(f"【调度详情】请求 {request_id} - 当前可用实例状态（按负载排序）:\n" + "\n".join(available_instances_log))
         
         # 重试循环
         retry_count = 0
@@ -853,7 +953,7 @@ class LLMPoolManager:
                         continue
                     else:
                         error_msg = f"所有LLM实例都已尝试，请求失败"
-                        logging.error(f"[{request_id}] {error_msg}")
+                        logging.error(f"【请求失败】{request_id}: {error_msg}")
                         return None, error_msg, None
                 
                 # 记录已尝试实例
@@ -861,28 +961,48 @@ class LLMPoolManager:
                 tried_instances.add(instance_key)
                 
                 # 记录切换池的信息（如果适用）
+                instance_type = "大模型" if instance in all_pool_instances else "小模型"
                 if (pool_type == "large" and instance in all_fallback_instances) or \
                    (pool_type == "small" and instance in all_pool_instances):
                     fallback_msg = f"切换到{'小' if pool_type == 'large' else '大'}模型池"
-                    logging.info(f"[{request_id}] {fallback_msg}")
+                    logging.info(f"【池切换】请求 {request_id}: {fallback_msg}")
                     if logger:
                         logger.info(fallback_msg, request_id)
                 
                 # 尝试增加并发计数
-                if not await instance.increment_concurrency():
+                incremented = await instance.increment_concurrency()
+                if not incremented:
+                    logging.warning(f"【并发控制】请求 {request_id}: 无法增加实例 {instance.model} 的并发计数，当前并发: {instance.current_concurrency}/{instance.max_concurrency}")
                     continue
                 
                 # 记录使用的LLM
                 llm_name = f"{instance.model} ({instance.url})"
+                logging.info(f"【请求分配】请求 {request_id} 分配给 {instance_type} 实例: {llm_name}, 当前并发: {instance.current_concurrency}/{instance.max_concurrency}")
+                
                 if logger:
                     logger.info(f"使用LLM: {llm_name}", request_id)
                 
+                # 记录增加并发后的池状态
+                new_large_load = self.large_pool.get_current_load()
+                new_small_load = self.small_pool.get_current_load()
+                logging.info(f"【负载变化】请求 {request_id} 分配后池状态 - 大模型: {new_large_load}/{large_capacity}, 小模型: {new_small_load}/{small_capacity}")
+                
                 # 发送请求
+                start_time = time.time()
                 response, error = await instance.send_request(endpoint, payload, stream)
+                request_time = time.time() - start_time
+                
+                # 请求结束后，减少并发计数
+                await instance.decrement_concurrency()
+                
+                # 记录减少并发后的池状态
+                after_large_load = self.large_pool.get_current_load()
+                after_small_load = self.small_pool.get_current_load()
+                logging.info(f"【负载变化】请求 {request_id} 完成后池状态 - 大模型: {after_large_load}/{large_capacity}, 小模型: {after_small_load}/{small_capacity}, 请求耗时: {request_time:.2f}秒")
                 
                 if error:
                     # 如果失败，记录错误并继续重试
-                    logging.error(f"[{request_id}] 请求LLM失败: {error}")
+                    logging.error(f"【请求失败】请求 {request_id} LLM调用失败: {error}")
                     if logger:
                         logger.log_error_retry(
                             request_id=request_id,
@@ -891,26 +1011,51 @@ class LLMPoolManager:
                             retry_attempt=retry_count + 1,
                             max_retries=self.max_retries
                         )
-                else:
-                    # 成功，返回响应
-                    return response, None, llm_name
-            
-            except Exception as e:
-                error_msg = f"请求处理异常: {str(e)}"
-                logging.error(f"[{request_id}] {error_msg}")
+                    
+                    # 标记为不可用（如果是连接错误）
+                    if "connection" in error.lower() or "timeout" in error.lower():
+                        await instance.mark_unavailable()
+                    
+                    # 等待一段时间后继续
+                    retry_count += 1
+                    if retry_count < self.max_retries:
+                        await asyncio.sleep(self.retry_delay * (2 ** retry_count))  # 指数退避
+                    continue
                 
+                # 请求成功
+                logging.info(f"【请求成功】请求 {request_id} 在 {instance_type} 实例 {instance.model} 上执行成功")
+                return response, None, llm_name
+            except Exception as e:
+                error_msg = f"发送请求异常: {str(e)}"
+                logging.error(f"【请求异常】{request_id}: {error_msg}")
+                
+                # 如果实例存在，减少并发计数
+                if instance:
+                    await instance.decrement_concurrency()
+                    
+                    # 记录减少并发后的池状态
+                    after_large_load = self.large_pool.get_current_load()
+                    after_small_load = self.small_pool.get_current_load()
+                    logging.info(f"【负载变化】请求 {request_id} 异常后池状态 - 大模型: {after_large_load}/{large_capacity}, 小模型: {after_small_load}/{small_capacity}")
+                
+                # 记录重试信息
                 if logger:
-                    logger.error(error_msg, request_id)
-            
-            # 尝试下一个实例或增加重试计数
-            if len(tried_instances) >= len(all_available_instances):
+                    logger.log_error_retry(
+                        request_id=request_id,
+                        llm_name=f"{instance.model if instance else 'unknown'} ({instance.url if instance else 'unknown'})",
+                        error_message=error_msg,
+                        retry_attempt=retry_count + 1,
+                        max_retries=self.max_retries
+                    )
+                
+                # 等待一段时间后继续
                 retry_count += 1
                 if retry_count < self.max_retries:
                     await asyncio.sleep(self.retry_delay * (2 ** retry_count))  # 指数退避
         
         # 所有重试都失败
         error_msg = f"达到最大重试次数 ({self.max_retries})，请求失败"
-        logging.error(f"[{request_id}] {error_msg}")
+        logging.error(f"【请求失败】{request_id}: {error_msg}")
         return None, error_msg, None
     
     def _clean_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:

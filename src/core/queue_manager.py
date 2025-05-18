@@ -18,7 +18,7 @@ class QueuedRequest:
     # 请求到达时间
     arrival_time: float = field(compare=False)
     
-    # 请求超时时间点
+    # 请求超时时间点 (保留但不再使用)
     timeout_time: float = field(compare=False)
     
     # 请求ID
@@ -47,7 +47,7 @@ class QueueManager:
         
         Args:
             max_queue_length: 最大队列长度
-            default_timeout_seconds: 默认请求超时时间(秒)
+            default_timeout_seconds: 默认请求超时时间(秒)，已禁用超时功能
         """
         self.max_queue_length = max_queue_length
         self.default_timeout = default_timeout_seconds
@@ -58,7 +58,7 @@ class QueueManager:
         # 队列锁，确保线程安全
         self.queue_lock = threading.Lock()
         
-        # 超时检查线程
+        # 超时检查线程 - 保留线程但不执行超时检查
         self.timeout_checker_thread = threading.Thread(
             target=self._timeout_checker,
             daemon=True,
@@ -67,7 +67,7 @@ class QueueManager:
         self.running = True
         self.timeout_checker_thread.start()
         
-        logging.info(f"队列管理器已初始化，最大长度: {max_queue_length}, 默认超时: {default_timeout_seconds}秒")
+        logging.info(f"队列管理器已初始化，最大长度: {max_queue_length}, 超时检查已禁用")
     
     def enqueue_request(
         self,
@@ -86,8 +86,8 @@ class QueueManager:
             model_pool: 模型池类型 ("large", "small")
             request_data: 请求数据
             user_level: 用户等级 (0-10, 数字越大优先级越高)
-            timeout_seconds: 超时时间(秒)，如果为None则使用默认值
-            callback: 回调函数，在请求被处理或超时时调用
+            timeout_seconds: 超时时间(秒)，已禁用，仅为兼容性保留
+            callback: 回调函数，在请求被处理时调用
             
         Returns:
             (成功/失败, 错误消息)
@@ -97,10 +97,9 @@ class QueueManager:
             if len(self.request_queue) >= self.max_queue_length:
                 return False, "队列已满，请稍后重试"
             
-            # 设置超时时间
-            timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout
+            # 设置时间 (timeout已禁用，设置为很大的值)
             arrival_time = time.time()
-            timeout_time = arrival_time + timeout
+            timeout_time = arrival_time + 24*60*60  # 设置为24小时，实际上不会使用
             
             # 计算优先级（基于用户等级）
             # 优先级数字越小越优先处理
@@ -124,7 +123,7 @@ class QueueManager:
             # 计算队列位置
             queue_position = self._get_position(request_id)
             
-            logging.info(f"请求 {request_id} 已加入队列, 位置: {queue_position}, 优先级: {priority}, 超时: {timeout}秒")
+            logging.info(f"请求 {request_id} 已加入队列, 位置: {queue_position}, 优先级: {priority}, 目标池: {model_pool}")
             
             return True, f"请求已加入队列，位置: {queue_position}"
     
@@ -142,6 +141,11 @@ class QueueManager:
             if not self.request_queue:
                 return None
             
+            # 记录当前队列中不同类型请求的数量
+            large_requests = sum(1 for req in self.request_queue if req.model_pool == "large")
+            small_requests = sum(1 for req in self.request_queue if req.model_pool == "small")
+            logging.debug(f"当前队列状态: 总数={len(self.request_queue)}, 大模型请求={large_requests}, 小模型请求={small_requests}")
+            
             # 首先尝试取出指定模型池的请求
             for i, request in enumerate(self.request_queue):
                 if request.model_pool == model_pool:
@@ -149,10 +153,33 @@ class QueueManager:
                     request = self.request_queue.pop(i)
                     # 重建堆
                     heapq.heapify(self.request_queue)
-                    logging.info(f"请求 {request.request_id} 已从队列中取出，等待时间: {time.time() - request.arrival_time:.2f}秒")
+                    wait_time = time.time() - request.arrival_time
+                    logging.info(f"请求 {request.request_id} 已从队列中取出，等待时间: {wait_time:.2f}秒, 指定模型池: {model_pool}")
                     return request
             
-            # 如果没有找到指定模型池的请求，返回None
+            # 如果没有找到指定模型池的请求，尝试获取任意请求（灵活调度）
+            # 只有当另一个池的负载为零时，才考虑灵活分配请求
+            if model_pool == "large" and small_requests > 0:
+                # 大模型池空闲，可以考虑处理小模型请求
+                for i, request in enumerate(self.request_queue):
+                    if request.model_pool == "small":
+                        request = self.request_queue.pop(i)
+                        heapq.heapify(self.request_queue)
+                        wait_time = time.time() - request.arrival_time
+                        logging.info(f"请求 {request.request_id} 已从队列中取出(灵活调度到大模型池)，等待时间: {wait_time:.2f}秒")
+                        return request
+            elif model_pool == "small" and large_requests > 0:
+                # 小模型池空闲，可以考虑处理大模型请求
+                for i, request in enumerate(self.request_queue):
+                    if request.model_pool == "large":
+                        request = self.request_queue.pop(i)
+                        heapq.heapify(self.request_queue)
+                        wait_time = time.time() - request.arrival_time
+                        logging.info(f"请求 {request.request_id} 已从队列中取出(灵活调度到小模型池)，等待时间: {wait_time:.2f}秒")
+                        return request
+            
+            # 如果没有找到任何符合条件的请求，返回None
+            logging.debug(f"模型池 {model_pool} 未找到合适的请求")
             return None
     
     def get_queue_length(self) -> int:
@@ -164,6 +191,22 @@ class QueueManager:
         """
         with self.queue_lock:
             return len(self.request_queue)
+    
+    def get_queue_details(self) -> Dict[str, int]:
+        """
+        获取队列中不同类型请求的数量
+        
+        Returns:
+            包含不同请求类型数量的字典
+        """
+        with self.queue_lock:
+            large_requests = sum(1 for req in self.request_queue if req.model_pool == "large")
+            small_requests = sum(1 for req in self.request_queue if req.model_pool == "small")
+            return {
+                "total": len(self.request_queue),
+                "large": large_requests,
+                "small": small_requests
+            }
     
     def _get_position(self, request_id: str) -> int:
         """
@@ -210,40 +253,14 @@ class QueueManager:
     
     def _timeout_checker(self) -> None:
         """
-        超时检查线程，定期检查并移除超时的请求
+        超时检查线程 - 已禁用超时检查逻辑，只维持线程运行
         """
         while self.running:
             try:
-                with self.queue_lock:
-                    current_time = time.time()
-                    timed_out_indices = []
-                    
-                    # 找出所有已超时的请求
-                    for i, req in enumerate(self.request_queue):
-                        if current_time > req.timeout_time:
-                            timed_out_indices.append(i)
-                    
-                    # 从后向前移除超时请求（避免索引变化问题）
-                    for i in sorted(timed_out_indices, reverse=True):
-                        timed_out_req = self.request_queue.pop(i)
-                        logging.warning(f"请求 {timed_out_req.request_id} 已超时，从队列中移除")
-                        
-                        # 调用回调函数，报告超时
-                        if timed_out_req.callback:
-                            try:
-                                timed_out_req.callback(None, "请求超时")
-                            except Exception as e:
-                                logging.error(f"超时回调执行失败: {str(e)}")
-                    
-                    # 如果移除了请求，需要重新构建堆
-                    if timed_out_indices:
-                        heapq.heapify(self.request_queue)
-            
+                # 不再执行超时检查，只是等待
+                time.sleep(5)
             except Exception as e:
                 logging.error(f"超时检查线程错误: {str(e)}")
-            
-            # 间隔一段时间再次检查
-            time.sleep(1)
     
     def shutdown(self) -> None:
         """
