@@ -280,7 +280,40 @@ class OpenAICompatibleAPI:
         full_content = ""
         
         for chunk in response:
-            chunk_json = json.dumps(chunk)
+            # 尝试将 chunk 对象序列化为 JSON 字符串
+            # OpenAI 的 ChatCompletionChunk 对象通常是 Pydantic 模型，
+            # 可以使用 .model_dump_json() 方法直接序列化为 JSON 字符串，
+            # 或者使用 .model_dump() 转换为字典后再用 json.dumps()。
+            # 我们优先使用 .model_dump_json()。
+            try:
+                # 尝试使用 Pydantic V2 的方法
+                chunk_json = chunk.model_dump_json()
+            except AttributeError:
+                # 如果 model_dump_json 不存在，尝试 Pydantic V1 的 dict() 或其他转换为字典的方法
+                try:
+                    if hasattr(chunk, 'model_dump'): # Pydantic V2 model_dump
+                        chunk_dict = chunk.model_dump()
+                    elif hasattr(chunk, 'dict'): # Pydantic V1 dict()
+                        chunk_dict = chunk.dict()
+                    elif hasattr(chunk, 'to_dict'): # 一些库可能使用 to_dict()
+                        chunk_dict = chunk.to_dict()
+                    else: # 最后尝试直接转 __dict__，但这通常不适用于复杂的嵌套对象
+                        chunk_dict = chunk.__dict__
+                    chunk_json = json.dumps(chunk_dict)
+                except Exception as e:
+                    logging.error(f"[{request_id}] 无法序列化 chunk 对象: {chunk}. 错误: {e}")
+                    # 如果序列化失败，发送一个错误信息给客户端并停止
+                    error_payload = {
+                        "error": {
+                            "message": f"Failed to serialize response chunk: {type(chunk).__name__}",
+                            "type": "serialization_error",
+                            "code": "INTERNAL_SERVER_ERROR"
+                        }
+                    }
+                    yield f"data: {json.dumps(error_payload)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
             if chunk_count == 0:
                 logging.info(f"[{request_id}] 开始返回流式响应，首个chunk: {chunk_json}")
             elif chunk_count % 10 == 0:  # 每10个chunk记录一次，避免日志过多
