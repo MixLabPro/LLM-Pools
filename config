@@ -1,0 +1,41 @@
+{
+  "large_models": [
+    {
+      "url": "https://api.example.com/v1",
+      "model": "gpt-4",
+      "api_key": "key1"
+    },
+    {
+      "url": "https://api.another-provider.com/v1",
+      "model": "claude-3",
+      "api_key": "key2"
+    }
+  ],
+  "small_models": [
+    {
+      "url": "https://api.example.com/v1",
+      "model": "gpt-3.5-turbo",
+      "api_key": "key3"
+    },
+    {
+      "url": "https://api.llama.ai/v1",
+      "model": "llama-7b",
+      "api_key": "key4"
+    }
+  ],
+  "queue_settings": {
+    "max_queue_length": 100,
+    "default_timeout": 30
+  },
+  "retry_settings": {
+    "max_retries": 3,
+    "retry_delay_ms": 100,
+    "retry_multiplier": 2
+  },
+  "logging": {
+    "level": "info",
+    "file_path": "./logs/router.log",
+    "rotate_size_mb": 10,
+    "keep_logs_days": 7
+  }
+} 
